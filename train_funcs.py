@@ -116,7 +116,7 @@ class Generator(nn.Module):
             nn.ConvTranspose2d(
                 in_channels, out_channels, kernel_size, stride, padding, bias=False
             ),
-            nn.BatchNorm2d(out_channels),
+            nn.InstanceNorm2d(out_channels),
             nn.ReLU(),
         )
 
@@ -159,10 +159,10 @@ class Discriminator(nn.Module):
             nn.Linear(1024 * (img_size_h // 16) * (img_size_w // 16) + condition_dim, 1024),
             nn.LeakyReLU(0.2),
             nn.Linear(1024, 1)
-            # No Sigmoid here! We'll use BCEWithLogitsLoss for stability.
+            # No Sigmoid here!
         )
 
-    def _block(self, in_channels, out_channels, kernel_size, stride, padding, use_norm=True):
+    def _block(self, in_channels, out_channels, kernel_size, stride, padding, use_norm=False):
         layers = [
             nn.Conv2d(
                 in_channels, out_channels, kernel_size, stride, padding, bias=False
@@ -231,3 +231,31 @@ class PadToWidth:
         padding = (0, 0, padding_needed, 0) 
         
         return F.pad(img, padding, fill=self.fill_color)
+
+
+def calculate_gradient_penalty(critic, real_samples, fake_samples, condition, DEVICE, LAMBDA_GP):
+    """Calculates the gradient penalty for WGAN-GP."""
+
+    # Randomly sample interpolation points between real and fake
+    alpha = torch.rand((real_samples.size(0), 1, 1, 1)).to(DEVICE)
+    interpolates = (alpha * real_samples + ((1 - alpha) * fake_samples)).requires_grad_(True).to(DEVICE)
+
+    # Critic scores on interpolates
+    interpolates_out = critic(interpolates, condition)
+
+    # Calculate gradients of the critic's output w.r.t. the input interpolates
+    gradients = torch.autograd.grad(
+        outputs=interpolates_out,
+        inputs=interpolates,
+        grad_outputs=torch.ones_like(interpolates_out),
+        create_graph=True,  # Needed for second-order derivatives in the training loop
+        retain_graph=True,
+        only_inputs=True,
+    )[0]
+
+    # Calculate penalty
+    gradients = gradients.view(gradients.size(0), -1)
+    gradient_norm = gradients.norm(2, dim=1)
+    gradient_penalty = LAMBDA_GP * ((gradient_norm - 1) ** 2).mean()
+
+    return gradient_penalty

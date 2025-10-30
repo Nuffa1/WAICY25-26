@@ -51,8 +51,12 @@ if __name__ == '__main__':
     EMBEDDING_DIM = 256
     CONDITION_DIM = 128  # The output size of TextEncoder
     Z_DIM = 100  # Noise dimension
-    LR = 2e-4
-    BETA1 = 0.5
+    LR_D = 0.0001
+    LR_G = 0.0001
+    BETA1 = 0.0
+    BETA2 = 0.9
+    D_STEPS = 5  # Train D 5 times every time G is trained
+    LAMBDA_GP = 10.0
     NUM_EPOCHS = 100  # Add more later
 
     # Initialize Models
@@ -70,11 +74,10 @@ if __name__ == '__main__':
             nn.init.constant_(m.bias.data, 0)
 
     # Loss and Optimizers
-    criterion = nn.BCEWithLogitsLoss()
-    opt_disc = optim.Adam(disc.parameters(), lr=LR, betas=(BETA1, 0.999))
+    opt_disc = optim.Adam(disc.parameters(), lr=LR_D, betas=(BETA1, 0.999))
     opt_gen = optim.Adam(
         list(gen.parameters()) + list(text_encoder.parameters()),
-        lr=LR,
+        lr=LR_G,
         betas=(BETA1, 0.999)
     )
 
@@ -92,7 +95,7 @@ if __name__ == '__main__':
         checkpoint_path = f"checkpoints/checkpoint_epoch_{latest_epoch_num}.pth"
 
         if os.path.exists(checkpoint_path):
-            print(f"Loading ALL models and optimizers from epoch {latest_epoch_num}...")
+            print(f"Loading models and optimizers from epoch {latest_epoch_num}...")
 
             checkpoint = torch.load(checkpoint_path, map_location=DEVICE)
 
@@ -138,53 +141,63 @@ if __name__ == '__main__':
 
     print("Starting Training...")
 
-    progress_bar = tqdm(total=train_dataset.__len__())
+    progress_bar = tqdm(total = np.ceil(train_dataset.__len__() / BATCH_SIZE) * (NUM_EPOCHS - start_epoch))
 
     for epoch in range(start_epoch, NUM_EPOCHS):
         for batch_idx, (real_images, text_ids) in enumerate(train_loader):
             real_images = real_images.to(DEVICE)
             text_ids = text_ids.to(DEVICE)
+            noise_level = 0.01
 
             # Get the condition vector (c)
             condition = text_encoder(text_ids)
+            noise = torch.randn(real_images.size(0), Z_DIM).to(DEVICE)
 
             # --- Train Discriminator ---
-            opt_disc.zero_grad()
+            for _ in range(D_STEPS):
+                opt_disc.zero_grad()
 
-            # Train with real images
-            # Use condition.detach() so text encoder is not updated
-            d_real_output = disc(real_images, condition.detach()).reshape(-1)
-            d_real_loss = criterion(d_real_output, torch.ones_like(d_real_output))
-            d_real_loss.backward()
+                # Add noise and label smoothing
+                real_labels = torch.empty(real_images.size(0), 1).uniform_(0.7, 1.0).to(DEVICE)
+                noise_d = torch.randn_like(real_images) * noise_level
 
-            # Train with fake images
-            noise = torch.randn(real_images.size(0), Z_DIM).to(DEVICE)
-            fake_images = gen(noise, condition.detach())
-            # Use condition.detach() so generator is not updated
-            d_fake_output = disc(fake_images.detach(), condition.detach()).reshape(-1)
-            d_fake_loss = criterion(d_fake_output, torch.zeros_like(d_fake_output))
-            d_fake_loss.backward()
+                # Train with real images
+                # Use condition.detach() so text encoder is not updated
+                d_real_output = disc(real_images + noise_d, condition.detach()).reshape(-1)
 
-            # Total discriminator loss
-            d_loss = (d_real_loss + d_fake_loss) / 2
-            opt_disc.step()
+                # Train with fake images
+                with torch.no_grad():
+                    fake_images = gen(noise, condition.detach())
+                d_fake_output = disc(fake_images.detach(), condition.detach()).reshape(-1)
+
+                # Calculate gradient penalty
+                gp = calculate_gradient_penalty(
+                    disc,
+                    real_images,
+                    fake_images.detach(),
+                    condition.detach(),
+                    DEVICE,
+                    LAMBDA_GP
+                )
+
+                d_loss = d_fake_output.mean() - d_real_output.mean() + gp
+                d_loss.backward()
+                opt_disc.step()
 
             # --- Train Generator ---
             opt_gen.zero_grad()
 
-            # Get fresh condition vector (no detaching so encoder is updated)
-            condition_gen = text_encoder(text_ids)
-
             # Generate new fake images
-            fake_images_gen = gen(noise, condition_gen)
+            fake_images_gen = gen(noise, condition)
 
             # See what the discriminator thinks (no detaching)
-            g_output = disc(fake_images_gen, condition_gen).reshape(-1)
+            # g_output = disc(fake_images_gen, condition_gen).reshape(-1)
+            g_output = disc(fake_images_gen, condition).reshape(-1)
 
             # Calculate loss (Generator wants discriminator to think they are real)
-            g_loss = criterion(g_output, torch.ones_like(g_output))
+            g_loss = -g_output.mean()
 
-            # Backprop (updates both generatir and text encoder)
+            # Backprop (updates both generator and text encoder)
             g_loss.backward()
             opt_gen.step()
 
@@ -194,27 +207,30 @@ if __name__ == '__main__':
                     f"[Epoch {epoch + 1}/{NUM_EPOCHS}] [Batch {batch_idx + 1}/{len(train_loader)}] "
                     f"D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f}"
                 )
+
+                # Save generated images at the end of each epoch
+                with torch.no_grad():
+                    fixed_condition = text_encoder(fixed_text_ids)
+                    fake_samples = gen(fixed_noise, fixed_condition)
+                    vutils.save_image(
+                        fake_samples,
+                        f"outputs/fake_samples_epoch_{epoch + 1}.png",
+                        normalize=True
+                    )
+
+                # Save a model training checkpoint at the end of each epoch
+                checkpoint = {
+                    'epoch': epoch + 1,
+                    'gen_state_dict': gen.state_dict(),
+                    'disc_state_dict': disc.state_dict(),
+                    'encoder_state_dict': text_encoder.state_dict(),
+                    'opt_gen_state_dict': opt_gen.state_dict(),
+                    'opt_disc_state_dict': opt_disc.state_dict(),
+                }
+                if epoch != 0:
+                    os.remove(f"checkpoints/checkpoint_epoch_{epoch}.pth")
+                torch.save(checkpoint, f"checkpoints/checkpoint_epoch_{epoch + 1}.pth")
+
             progress_bar.update(1)
-
-        # Save generated images at the end of each epoch
-        with torch.no_grad():
-            fixed_condition = text_encoder(fixed_text_ids)
-            fake_samples = gen(fixed_noise, fixed_condition)
-            vutils.save_image(
-                fake_samples,
-                f"outputs/fake_samples_epoch_{epoch + 1}.png",
-                normalize=True
-            )
-
-        # Save a model training checkpoint at the end of each epoch
-        checkpoint = {
-            'epoch': epoch + 1,
-            'gen_state_dict': gen.state_dict(),
-            'disc_state_dict': disc.state_dict(),
-            'encoder_state_dict': text_encoder.state_dict(),
-            'opt_gen_state_dict': opt_gen.state_dict(),
-            'opt_disc_state_dict': opt_disc.state_dict(),
-        }
-        torch.save(checkpoint, f"checkpoints/checkpoint_epoch_{epoch + 1}.pth")
 
     print("Training finished.")
