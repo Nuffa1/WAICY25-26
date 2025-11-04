@@ -61,23 +61,48 @@ class HW_Dataset(Dataset):
         padded_text_ids[:len(text_ids)] = torch.tensor(text_ids)
         
         return img_tensor, padded_text_ids
-    
+
+
+import torch.nn.functional as F
+
+class Attention(nn.Module):
+    def __init__(self, hidden_size):
+        super().__init__()
+        # We need layers to calculate the attention "energy"
+        # This will score how important each RNN output state is.
+        self.W_a = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.V_a = nn.Linear(hidden_size, 1, bias=False)
+
+    def forward(self, rnn_outputs):
+        # rnn_outputs shape: (Batch_size, Max_seq_len, Hidden_size)
+        # Calculate the attention "energy" for each hidden state
+        scores = torch.tanh(self.W_a(rnn_outputs))
+        energy = self.V_a(scores)
+        # Get the attention weights (alpha) by applying softmax
+        alpha_weights = F.softmax(energy.squeeze(2), dim=1)
+        # Calculate the context vector
+        context_vector = torch.bmm(alpha_weights.unsqueeze(1), rnn_outputs)
+        return context_vector.squeeze(1)
+
 class TextEncoder(nn.Module):
     def __init__(self, vocab_size, embedding_dim, hidden_size, output_size):
         super().__init__()
         self.embedding = nn.Embedding(vocab_size, embedding_dim)
         # Use an LSTM to process the sequence of characters
-        self.rnn = nn.LSTM(embedding_dim, hidden_size, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
+        self.rnn = nn.LSTM(embedding_dim, hidden_size, num_layers=2, batch_first=True, bidirectional=True)
+        # Add an attention layer
+        rnn_output_size = hidden_size * 2
+        self.attention = Attention(rnn_output_size)
+        self.fc = nn.Linear(rnn_output_size, output_size)
         
     def forward(self, text_ids):
         # text_ids shape: (Batch_size, Max_seq_len)
         embedded = self.embedding(text_ids)
         # Pass through RNN/LSTM
-        _, (hidden, _) = self.rnn(embedded)
-        # Use the final hidden state and project to the desired output size
-        # hidden shape: (1, Batch_size, Hidden_size)
-        condition = self.fc(hidden.squeeze(0))
+        output, (hidden, _) = self.rnn(embedded)
+        # Pass all RNN outputs to the attention layer
+        context_vector = self.attention(output)
+        condition = self.fc(context_vector)
         return condition
 
 class Generator(nn.Module):
@@ -185,9 +210,10 @@ class Discriminator(nn.Module):
         
         # Classify
         return self.fc(combined)
-    
+
 from torch.nn.utils.rnn import pad_sequence
-from torchvision.transforms import functional as F
+from torchvision.transforms import functional as TF
+import torch.nn.functional as F
 
 class FixedHeightResize:
     """Resizes an image to a fixed height while preserving the aspect ratio."""
@@ -221,7 +247,7 @@ class PadToWidth:
         if current_width >= self.target_width:
             # If the image is already wide enough (or too wide), we just center-crop it.
             # This handles outliers, though you should choose max_width carefully.
-            return F.center_crop(img, (img.height, self.target_width)) 
+            return TF.center_crop(img, (img.height, self.target_width))
         
         # Calculate padding needed (only on the right)
         padding_needed = self.target_width - current_width
@@ -230,7 +256,7 @@ class PadToWidth:
         # We only pad on the right (right padding = padding_needed)
         padding = (0, 0, padding_needed, 0) 
         
-        return F.pad(img, padding, fill=self.fill_color)
+        return TF.pad(img, padding, fill=self.fill_color)
 
 
 def calculate_gradient_penalty(critic, real_samples, fake_samples, condition, DEVICE, LAMBDA_GP):
