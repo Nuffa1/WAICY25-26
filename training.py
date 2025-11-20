@@ -57,7 +57,7 @@ if __name__ == '__main__':
     BETA2 = 0.9
     D_STEPS = 5  # Train D 5 times every time G is trained
     LAMBDA_GP = 10.0
-    NUM_EPOCHS = 100
+    NUM_EPOCHS = 150
 
     # Initialize Models
     text_encoder = TextEncoder(VOCAB_SIZE, EMBEDDING_DIM, CONDITION_DIM, CONDITION_DIM).to(DEVICE)

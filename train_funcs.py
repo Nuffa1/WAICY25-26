@@ -165,6 +165,7 @@ class Discriminator(nn.Module):
     def __init__(self, condition_dim, img_channels, img_size_h, img_size_w):
         super().__init__()
 
+        # CNN blocks to process the image
         # Input: (img_channels, 64, 256)
         self.disc = nn.Sequential(
             # -> (128, 32, 128)
@@ -177,54 +178,39 @@ class Discriminator(nn.Module):
             self._block(512, 1024, 4, 2, 1),
         )
 
-        # Takes the CNN output (1024 channels) + the condition (condition_dim channels)
-        # and maps them to 1 single output channel (the "realness" score)
-        self.final_conv = nn.Conv2d(
-            in_channels=1024 + condition_dim,
-            out_channels=1,
-            kernel_size=4,
-            stride=1,
-            padding=1
+        # Flatten and combine with condition
+        # Output of disc: (N, 1024, 4, 16)
+        # Flattened size: 1024 * 4 * 16 = 65536
+        self.fc = nn.Sequential(
+            nn.Linear(1024 * (img_size_h // 16) * (img_size_w // 16) + condition_dim, 1024),
+            nn.LeakyReLU(0.2),
+            nn.Linear(1024, 1)
+            # No Sigmoid here!
         )
 
-        # Small linear layer to project the condition so it's ready to be tiled.
-        self.condition_projector = nn.Linear(condition_dim, condition_dim)
-
-    def _block(self, in_channels, out_channels, kernel_size, stride, padding):
-        layers = [nn.Conv2d(
-            in_channels, out_channels, kernel_size, stride, padding, bias=False
-        ), nn.LeakyReLU(0.2)]
-        # No normalization as recommended for WGAN-GP
+    def _block(self, in_channels, out_channels, kernel_size, stride, padding, use_norm=False):
+        layers = [
+            nn.Conv2d(
+                in_channels, out_channels, kernel_size, stride, padding, bias=False
+            )
+        ]
+        if use_norm:
+            layers.append(nn.BatchNorm2d(out_channels))
+        layers.append(nn.LeakyReLU(0.2))
         return nn.Sequential(*layers)
 
     def forward(self, x, condition):
-        # x shape: (N, C, 64, 256)
+        # x shape: (N, C, H, W)
         # condition shape: (N, condition_dim)
 
-        # 1. Pass image through the CNN body
-        x = self.disc(x)
-        # x shape is now (N, 1024, 4, 16)
+        x = self.disc(x)  # (N, 1024, 4, 16)
 
-        # 2. Project and tile the condition vector
-        c = self.condition_projector(condition)
-        # c shape: (N, condition_dim)
+        # Flatten and concatenate condition
+        x_flat = x.view(x.shape[0], -1)  # (N, 65536)
+        combined = torch.cat([x_flat, condition], dim=1)  # (N, 65536 + condition_dim)
 
-        # Tile c to match the spatial dimensions of x
-        # c.unsqueeze(-1) -> (N, condition_dim, 1)
-        # c.unsqueeze(-1).unsqueeze(-1) -> (N, condition_dim, 1, 1)
-        # Manually expand to the (4, 16) spatial size.
-        c_tiled = c.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, 4, 16)
-        # c_tiled shape: (N, condition_dim, 4, 16)
-
-        # 3. Concatenate image features and tiled condition
-        combined = torch.cat([x, c_tiled], dim=1)
-        # combined shape: (N, 1024 + condition_dim, 4, 16)
-
-        # 4. Pass through the final "patch head" convolution
-        patch_scores = self.final_conv(combined)
-        # Output shape is (N, 1, 3, 15)
-
-        return patch_scores
+        # Classify
+        return self.fc(combined)
 
 from torch.nn.utils.rnn import pad_sequence
 from torchvision.transforms import functional as TF
